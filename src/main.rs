@@ -21,14 +21,15 @@ use tokio_core::reactor::Core;
 use inotify::{Inotify, WatchMask, EventOwned};
 use csv::Reader;
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct CombatantState {
     player: bool,
     turn: bool,
     init: u32,
     hp_cur: u32,
     hp_max: u32,
-    ac: u32
+    ac: u32,
+    extra: String
 }
 impl CombatantState {
     pub fn get_init(&self) -> String {
@@ -42,6 +43,14 @@ impl CombatantState {
     pub fn get_ac(&self) -> String {
         if self.player {
             format!(", AC {}", self.ac)
+        }
+        else {
+            "".into()
+        }
+    }
+    pub fn get_extra(&self) -> String {
+        if self.extra.trim() != "" {
+            format!(", {}", self.extra)
         }
         else {
             "".into()
@@ -111,7 +120,10 @@ impl State {
         Ok(ret)
     }
     pub fn print_combatant(&mut self, name: &str, c: CombatantState) -> Result<()> {
-        let desc = format!("{} <\x02{}{}\x0f> {}{}", c.get_init(), if !c.player { "\x0307" } else { "" }, name, c.get_hp(), c.get_ac());
+        if c.extra.contains("invisible") {
+            return Ok(());
+        }
+        let desc = format!("{} <\x02{}{}\x0f> {}{}{}", c.get_init(), if !c.player { "\x0307" } else { "" }, name, c.get_hp(), c.get_extra(), c.get_ac());
         self.irc.0.send_privmsg(&self.chan, &desc)?;
         Ok(())
     }
@@ -119,7 +131,7 @@ impl State {
         self.irc.0.send_privmsg(&self.chan, &format!("\x02\x0304Initiative table:"))?;
         for name in self.order.clone() {
             let c = {
-                *self.combatants.get(&name).unwrap()
+                self.combatants.get(&name).unwrap().clone()
             };
             self.print_combatant(&name, c)?;
         }
@@ -134,30 +146,53 @@ impl State {
                 return Ok(());
             }
         };
-        for CombatantRecord { init, turn, name, player, hp_cur, hp_max, ac } in rf {
+        for CombatantRecord { init, turn, name, player, hp_cur, hp_max, ac, extra } in rf {
             new_order.push(name.clone());
             let turn = turn.trim() != "";
             let player = player.trim() != "";
-            let new = CombatantState { player, init, turn, hp_cur, hp_max, ac };
+            let new = CombatantState { player, init, turn, hp_cur, hp_max, ac, extra };
             if let Some(c) = self.combatants.remove(&name) {
-                if c.hp_cur != new.hp_cur {
-                    let delta: i32 = c.hp_cur as i32 - hp_cur as i32;
-                    self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0F took \x02{}\x0F points of damage! ({} -> {})", name, delta, c.get_hp(), new.get_hp()))?;
+                let invis_old = c.extra.contains("invisible");
+                let invis_new = new.extra.contains("invisible");
+                if invis_old != invis_new {
+                    if invis_new && !invis_old {
+                        self.irc.0.send_privmsg(&self.chan, &format!("A wild \x02{}\x0f disappeared.", name))?;
+                    }
+                    else {
+                        self.irc.0.send_privmsg(&self.chan, &format!("A wild \x02{}\x0f appeared!", name))?;
+                        self.print_combatant(&name, new.clone())?;
+                    }
                 }
-                if c.init != new.init {
-                    self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0F's initiative changed from \x02{}\x0f to \x02{}\x0f.", name, c.init, new.init))?;
-                }
-                if c.turn != new.turn {
-                    if new.turn {
-                        self.irc.0.send_privmsg(&self.chan, &format!("It's now \x02{}\x0F's turn.", name))?;
-                        self.print_combatant(&name, new)?;
+                if !invis_new {
+                    if c.hp_cur != new.hp_cur {
+                        let delta: i32 = c.hp_cur as i32 - hp_cur as i32;
+                        self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0F took \x02{}\x0F points of damage! ({} -> {})", name, delta, c.get_hp(), new.get_hp()))?;
+                    }
+                    if c.init != new.init {
+                        self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0F's initiative changed from \x02{}\x0f to \x02{}\x0f.", name, c.init, new.init))?;
+                    }
+                    if c.extra != new.extra {
+                        if new.extra.trim() != "" {
+                            self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0f has tags: {}", name, new.extra))?;
+                        }
+                        else {
+                        self.irc.0.send_privmsg(&self.chan, &format!("\x02{}\x0f is no longer: {}", name, c.extra))?;
+                        }
+                    }
+                    if c.turn != new.turn {
+                        if new.turn {
+                            self.irc.0.send_privmsg(&self.chan, &format!("It's now \x02{}\x0F's turn.", name))?;
+                            self.print_combatant(&name, new.clone())?;
+                        }
                     }
                 }
                 self.combatants.insert(name, new);
             }
             else {
-                self.irc.0.send_privmsg(&self.chan, &format!("Combatant \x02{}\x0f joined the encounter!", name))?;
-                self.print_combatant(&name, new)?;
+                if !new.extra.contains("invisible") {
+                    self.irc.0.send_privmsg(&self.chan, &format!("Combatant \x02{}\x0f joined the encounter!", name))?;
+                }
+                self.print_combatant(&name, new.clone())?;
                 self.combatants.insert(name, new);
             }
         }
@@ -166,12 +201,12 @@ impl State {
         Ok(())
     }
     pub fn on_ready(&mut self) -> Result<()> {
-        for CombatantRecord { init, turn, name, player, hp_cur, hp_max, ac } in self.read_file()? {
+        for CombatantRecord { init, turn, name, player, hp_cur, hp_max, ac, extra } in self.read_file()? {
             let turn = turn.trim() != "";
             let player = player.trim() != "";
             println!("[+] reading combatant {}", name);
             self.order.push(name.clone());
-            self.combatants.insert(name, CombatantState { player, init, turn, hp_cur, hp_max, ac });
+            self.combatants.insert(name, CombatantState { player, init, turn, hp_cur, hp_max, ac, extra });
         }
         self.print_full_state()?;
         Ok(())
@@ -188,6 +223,9 @@ impl State {
             Command::PRIVMSG(_, msg) => {
                 if msg == "!table" {
                     self.print_full_state()?;
+                }
+                else if msg.contains("!send ") {
+                    self.irc.0.send_privmsg(&self.chan, &msg.replace("!send ", ""))?;
                 }
             },
             Command::JOIN(chanlist, _, _) => {
@@ -217,7 +255,8 @@ pub struct CombatantRecord {
     player: String,
     hp_cur: u32,
     hp_max: u32,
-    ac: u32
+    ac: u32,
+    extra: String
 }
 fn main() {
     let mut args = ::std::env::args();
